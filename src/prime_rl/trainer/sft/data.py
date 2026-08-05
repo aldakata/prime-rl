@@ -277,7 +277,10 @@ class SFTDataset(StatefulIterableDataset):
                 case "user":
                     return self.loss_mask_config.user
                 case "assistant":
-                    return self.loss_mask_config.assistant
+                    # Per-message override: a truthy "train" key on an assistant
+                    # message opts it into the loss even when the role default
+                    # is False (e.g. train only the post-tool-result answer).
+                    return bool(message.get("train", self.loss_mask_config.assistant))
                 case "system":
                     return self.loss_mask_config.system
                 case "tool":
