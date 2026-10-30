@@ -207,6 +207,12 @@ class GRPOAlgoConfig(BaseAlgoConfig):
     length_penalty: LengthPenaltyConfig | None = None
     """Linear length penalty subtracted from each reward before the GRPO baseline (see ``LinearLengthPenaltyConfig``): a ``pass_rate``-scaled sum of output-token, input-token, and turns terms, each normalized by the group's own max for that quantity. None disables it."""
 
+    std_floor: float | None = None
+    """Divide the mean-centred rewards by max(group reward std, std_floor) (the std normalisation of the original
+    GRPO, with a floor so that tiny reward gaps are not blown up to full-size advantages). None keeps the plain
+    mean-centred advantage. Example: std_floor = 0.1 turns a single +0.3 bonus in an otherwise uniform group of 8
+    into an advantage of ~2.8 instead of ~0.26, while a 0.01 gap stays at ~0.09."""
+
 
 class EchoAlgoConfig(GRPOAlgoConfig):
     type: Literal["echo"] = "echo"  # type: ignore[assignment]

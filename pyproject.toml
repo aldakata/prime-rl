@@ -74,6 +74,13 @@ disagg = [
     "nixl-cu12 ; platform_machine == 'x86_64'",
     "vllm-router",
 ]
+router = [
+    "vllm-router",
+]
+brutus = [
+    "obfuscated-arith-v1",
+    "obfuscated-gym-v1",
+]
 gpt-oss = [
     "kernels",
 ]
@@ -180,6 +187,8 @@ nixl-cu12 = false
 torchao = false
 
 [tool.uv.sources]
+obfuscated-arith-v1 = { path = "../brutus-unchained/obfuscation/env", editable = true }
+obfuscated-gym-v1 = { path = "../brutus-unchained/obfuscation/gym_env", editable = true }
 prime-rl-configs = { path = "packages/prime-rl-configs", editable = true }
 # prime-rl depends on the one `verifiers` package (v0 + v1 + the legacy bridge + the built-in v1
 # harnesses/tasksets, now bundled in verifiers.v1). v0 envs resolve from

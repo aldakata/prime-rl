@@ -1,6 +1,7 @@
 import gc
 import heapq
 import json
+import os
 import pickle
 import shutil
 import time
@@ -662,7 +663,11 @@ def maybe_clean(path: Path, step: int, interval_to_keep: int | None) -> None:
     checkpoint interval that we want to preserve.
     """
     logger = get_logger()
-    candidate_step = max(step - 2, 0)
+    # Local patch: keep a window of recent broadcasts instead of just one. A LoRA load on a busy engine can take
+    # minutes while the trainer advances several steps on buffered rollouts; deleting step-2 then makes the engine
+    # fail the load (404) and a second failed add_lora kills the engine core. Adapters are ~150 MB each.
+    keep = int(os.environ.get("PRIME_BROADCAST_KEEP", 8))
+    candidate_step = max(step - keep, 0)
     candidate_path = get_step_path(path, candidate_step)
     if interval_to_keep and candidate_step % interval_to_keep == 0:
         logger.debug(f"Keeping path {candidate_path} (on ckpt interval)")

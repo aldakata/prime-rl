@@ -175,6 +175,13 @@ def start_router(config: InferenceConfig) -> subprocess.Popen:
         "x-session-id",
         "--worker-startup-timeout-secs",
         "4200",
+        # Engines busy with long prefills or a weight update can miss a 5 s health check three times in a row,
+        # and the router then rejects every request with "No available workers" until they recover.
+        "--health-failure-threshold",
+        "20",
+        "--health-check-timeout-secs",
+        "30",
+        "--disable-circuit-breaker",
         "--prometheus-port",
         str(config.server.port + 21000),
     ]

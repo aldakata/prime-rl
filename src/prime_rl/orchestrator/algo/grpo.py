@@ -20,6 +20,7 @@ class GRPOAlgorithm(Algorithm):
     def __init__(self, config: GRPOAlgoConfig, policy_pool: InferencePool):
         super().__init__(config, policy_pool)
         self.length_penalty = config.length_penalty
+        self.std_floor = config.std_floor
 
     async def score_group(self, group: list[Rollout]) -> None:
         rewards = torch.tensor([rollout.reward for rollout in group], dtype=torch.float32)
@@ -39,5 +40,7 @@ class GRPOAlgorithm(Algorithm):
             penalty = rewards.mean() * penalty_frac
             shaped_rewards = rewards - penalty
             advantages = shaped_rewards - shaped_rewards.mean()
+        if self.std_floor is not None and len(group) > 1:
+            advantages = advantages / rewards.std(unbiased=False).clamp(min=self.std_floor)
         for rollout, advantage in zip(group, advantages.tolist(), strict=True):
             rollout.assign_advantages(advantage)

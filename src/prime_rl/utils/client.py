@@ -460,8 +460,8 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
 # `_PER_ATTEMPT` converts a hang into a TimeoutException so tenacity retries;
 # `_TOTAL` is the wall-clock budget across all retries — pick whichever
 # stop condition fires first.
-LORA_LOAD_READ_TIMEOUT_S = 30.0
-LORA_LOAD_TOTAL_TIMEOUT_S = 120.0
+LORA_LOAD_READ_TIMEOUT_S = 300.0  # a busy engine can take longer than 30 s to answer
+LORA_LOAD_TOTAL_TIMEOUT_S = 600.0
 
 
 async def load_lora_adapter(admin_clients: list[AsyncClient], lora_name: str, lora_path: Path) -> None:

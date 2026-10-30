@@ -57,7 +57,13 @@ class WeightWatcher:
             while not self.stopped.is_set():
                 next_step = self.compute_next_ckpt_step()
                 if next_step > self.ckpt_step:
-                    await self.apply_policy_update(next_step)
+                    try:
+                        await self.apply_policy_update(next_step)
+                    except Exception as exc:
+                        # An exception here used to end this task silently, so the policy version never
+                        # advanced and orchestrator and trainer waited on each other forever. The version is
+                        # already bumped before the inference update, so the next version just retries it.
+                        get_logger().warning(f"Weight update to step {next_step} failed, continuing: {exc!r}")
                 await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             return
