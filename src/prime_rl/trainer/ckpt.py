@@ -15,7 +15,7 @@ from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 from torch.nn import Module
-from torch.optim.lr_scheduler import LRScheduler
+from torch.optim.lr_scheduler import LRScheduler, SequentialLR
 from torch.optim.optimizer import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.processing_utils import ProcessorMixin
@@ -42,6 +42,19 @@ def _try_rmtree(path: Path, logger) -> None:
     except OSError as e:
         logger.warning(f"Failed to remove {path}: {e}, skipping cleanup")
 
+
+
+def _scheduled_lrs(scheduler: LRScheduler) -> list[float]:
+    """The lr ``scheduler`` prescribes at its current step, from the schedule's closed form rather than from the
+    optimizer's param groups (which chainable schedulers such as LinearLR derive their next lr from). Without this a
+    resume with CPU-offloaded optimizers keeps the warmup-start lr (lr * 1e-8) forever: Optimizer.load_state_dict is
+    never called in that branch, so param_groups["lr"] is never restored (found by brutus-mpi, 2026-10-31)."""
+    if isinstance(scheduler, SequentialLR):
+        active = scheduler._schedulers[bisect.bisect_right(scheduler._milestones, scheduler.last_epoch)]
+        return _scheduled_lrs(active)
+    if hasattr(scheduler, "_get_closed_form_lr"):
+        return scheduler._get_closed_form_lr()
+    return scheduler.get_last_lr()
 
 class AppState(Stateful):
     """
@@ -144,6 +157,10 @@ class AppState(Stateful):
 
         if self.scheduler is not None:
             self.scheduler.load_state_dict(state_dict["scheduler"])
+            lrs = _scheduled_lrs(self.scheduler)
+            for group, lr in zip(self.scheduler.optimizer.param_groups, lrs):
+                group["lr"] = lr
+            self.scheduler._last_lr = lrs
         if self.progress is not None:
             for key, value in state_dict["progress"].items():
                 setattr(self.progress, key, value)
