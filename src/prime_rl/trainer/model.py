@@ -1244,7 +1244,10 @@ def resolve_auto_attn(config: ModelConfig) -> None:
     if config.attn != "auto":
         return
     major, minor = torch.cuda.get_device_capability()
-    if (major, minor) == (10, 0):
+    if torch.version.hip is not None:
+        # ROCm: capability is the gfx arch (MI300A gfx942 -> (9, 4)), not an SM; only the ROCm FA2 build exists.
+        resolved = "flash_attention_2"
+    elif (major, minor) == (10, 0):
         resolved = "flash_attention_4"
     elif major == 9:
         resolved = "flash_attention_3"

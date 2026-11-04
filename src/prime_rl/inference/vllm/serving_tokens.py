@@ -31,12 +31,16 @@ from functools import cached_property
 from typing import Any
 
 from fastapi import Request
-from vllm.entrypoints.openai.engine.protocol import (
-    ErrorResponse,
-    PromptTokenUsageInfo,
-    RequestResponseMetadata,
-    UsageInfo,
-)
+try:  # vLLM <= 0.26
+    from vllm.entrypoints.openai.engine.protocol import (
+        ErrorResponse,
+        PromptTokenUsageInfo,
+        RequestResponseMetadata,
+        UsageInfo,
+    )
+except ImportError:  # vLLM >= 0.29 (ROCm container)
+    from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+    from vllm.entrypoints.serve.engine.protocol import ErrorResponse, PromptTokenUsageInfo, UsageInfo
 from vllm.entrypoints.scale_out.token_in_token_out.protocol import (
     GenerateRequest,
     GenerateResponse,

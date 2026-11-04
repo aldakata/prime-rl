@@ -61,6 +61,10 @@ def get_physical_gpu_ids() -> list[int]:
     """Return physical GPU IDs visible to the launcher."""
     raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if raw_visible is None:
+        import torch
+
+        if torch.version.hip is not None:  # ROCm: no NVML
+            return list(range(torch.cuda.device_count()))
         pynvml.nvmlInit()
         return list(range(pynvml.nvmlDeviceGetCount()))
     return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]
