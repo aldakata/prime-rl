@@ -215,6 +215,17 @@ vllm.entrypoints.openai.api_server.init_app_state = custom_init_app_state
 vllm.entrypoints.openai.api_server.build_app = custom_build_app
 vllm.v1.utils.run_api_server_worker_proc = custom_run_api_server_worker_proc
 
+# vLLM >= 0.29: run_server lives in launchers.api_server.entry and resolves build_app /
+# init_app_state from that module's globals; openai.api_server is only a re-export shim,
+# so patching it alone silently drops our custom routes (/load_lora_adapter, /update_weights, ...).
+try:
+    import vllm.entrypoints.launchers.api_server.entry as _launcher_entry
+
+    _launcher_entry.build_app = custom_build_app
+    _launcher_entry.init_app_state = custom_init_app_state
+except ImportError:
+    pass
+
 
 # Adapted from vllm/entrypoints/cli/serve.py
 # Only difference we do some config translation (i.e. pass populated namespace
