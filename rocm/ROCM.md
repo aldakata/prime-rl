@@ -152,7 +152,7 @@ model = "Qwen/Qwen3.5-4B"
 port = 8300          # router port; reader_base_url = "http://localhost:8300/v1"
 replicas = 2
 util = 0.85
-policy = "round_robin"   # default cache_aware pins most requests to one replica
+policy = "round_robin"   # the default; cache_aware pinned 168 of 178 requests to one replica
 args = "--max-num-seqs 256 --max-model-len 16384 --max-num-batched-tokens 2048 --enable-prefix-caching --language-model-only --attention-backend TRITON_ATTN"
 ```
 

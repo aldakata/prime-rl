@@ -7,7 +7,7 @@
       [[slurm.template_extra.pools]]   one vLLM replica per APU, behind one vllm-router
       name = "reader"; model = "Qwen/Qwen3.5-27B"; port = 8300 (router port, on the orchestrator node's
       localhost, so the taskset keeps reader_base_url = "http://localhost:8300/v1"); replicas = 4; util = 0.85;
-      args = "--max-model-len 16384 ..."; policy = "cache_aware"
+      args = "--max-model-len 16384 ..."; policy = "round_robin" (default; cache_aware pins long no-reuse prefills to one replica)
     Render inside the container with `rl @ cfg.toml --dry-run`, then `sbatch <output_dir>/rl.sbatch` on the host
     (sbatch is not in the container). Deployment: single_node (rl on node 0) or multi_node (dense, 1 node per
     inference replica). Reader-pool nodes come after the main nodes. Every component runs via apptainer with the
@@ -67,7 +67,7 @@ export MAIN_HOSTS_STR="${HOSTNAMES[*]:0:$N_MAIN}" POOL_HOSTS_STR="${HOSTNAMES[*]
 # node_idx|apu|port|pool|model|util|args, one per replica
 export POOL_SPECS_STR="{% for s in ns.specs %}{{ s[0] }}|{{ s[1] }}|{{ s[2] }}|{{ s[3] }}|{{ s[4] }}|{{ s[5] }}|{{ s[6] }}{% if not loop.last %};{% endif %}{% endfor %}"
 # pool|router_port|policy
-export POOLS_STR="{% for p in pools %}{{ p.name }}|{{ p.port }}|{{ p.get('policy', 'cache_aware') }}{% if not loop.last %};{% endif %}{% endfor %}"
+export POOLS_STR="{% for p in pools %}{{ p.name }}|{{ p.port }}|{{ p.get('policy', 'round_robin') }}{% if not loop.last %};{% endif %}{% endfor %}"
 echo "main nodes: $MAIN_HOSTS_STR | pool nodes: $POOL_HOSTS_STR"
 echo "pool replicas: $POOL_SPECS_STR"
 
