@@ -1,0 +1,259 @@
+#!/bin/bash
+{#- prime-rl SLURM template for MPCDF Viper (AMD MI300A, ROCm vLLM container). Use with
+      [slurm]
+      template_path = "<repo>/rocm/viper_rl.sbatch.j2"
+      [slurm.template_extra]  (all optional except pools; defaults are the /ptmp/atatjer setup)
+      sif, venv, binds, modules, env = {..}, pool_port_base = 8400, startup_timeout = 2400, mem_log = true
+      [[slurm.template_extra.pools]]   one vLLM replica per APU, behind one vllm-router
+      name = "reader"; model = "Qwen/Qwen3.5-27B"; port = 8300 (router port, on the orchestrator node's
+      localhost, so the taskset keeps reader_base_url = "http://localhost:8300/v1"); replicas = 4; util = 0.85;
+      args = "--max-model-len 16384 ..."; policy = "cache_aware"
+    Render inside the container with `rl @ cfg.toml --dry-run`, then `sbatch <output_dir>/rl.sbatch` on the host
+    (sbatch is not in the container). Deployment: single_node (rl on node 0) or multi_node (dense, 1 node per
+    inference replica). Reader-pool nodes come after the main nodes. Every component runs via apptainer with the
+    venv; cleanup only kills PIDs recorded here (no pkill). If <output_dir>/checkpoints/step_* exists the run
+    resumes (--ckpt.resume-step -1), so jobs can be chained with --dependency=afterany. -#}
+{%- set x = extra or {} %}
+{%- set pools = x.get('pools', []) %}
+{%- set apn = gpus_per_node %}
+{%- set single = num_train_nodes is not defined %}
+{%- set n_main = 1 if single else (num_train_nodes + num_infer_nodes) %}
+{%- set ns = namespace(slot=0, specs=[]) %}
+{%- for p in pools %}{%- for r in range(p.replicas) %}
+{%- set ns.specs = ns.specs + [[ns.slot // apn, ns.slot % apn, x.get('pool_port_base', 8400) + ns.slot, p.name, p.model, p.get('util', 0.85), p.get('args', '')]] %}
+{%- set ns.slot = ns.slot + 1 %}
+{%- endfor %}{%- endfor %}
+{%- set n_pool_nodes = (ns.slot + apn - 1) // apn %}
+#SBATCH --job-name={{ job_name }}
+#SBATCH --nodes={{ n_main + n_pool_nodes }}
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task={{ x.get('cpus_per_node', 48) }}
+#SBATCH --gres=gpu:{{ gpus_per_node }}
+#SBATCH --exclusive
+#SBATCH --partition={{ partition }}
+{%- if account %}
+#SBATCH --account={{ account }}
+{%- endif %}
+{%- if time %}
+#SBATCH --time={{ time }}
+{%- endif %}
+{%- if nodelist %}
+#SBATCH --nodelist={{ nodelist }}
+{%- endif %}
+{%- if exclude %}
+#SBATCH --exclude={{ exclude }}
+{%- endif %}
+#SBATCH --output={{ output_dir }}/job_%j.log
+#SBATCH --error={{ output_dir }}/job_%j.log
+set -uo pipefail
+
+export OUTPUT_DIR={{ output_dir }}
+export PROJECT_DIR={{ project_dir }}
+export VDIR=$OUTPUT_DIR/viper/$SLURM_JOB_ID LOGDIR=$OUTPUT_DIR/logs
+mkdir -p $VDIR $LOGDIR/pools $LOGDIR/trainer $LOGDIR/inference
+export SIF={{ x.get('sif', '/ptmp/atatjer/containers/vllm-rocm10.1-0.29.0.sif') }}
+export VENV={{ x.get('venv', '/ptmp/atatjer/venvs/prl') }}
+export MODULES="{{ x.get('modules', 'apptainer/1.5.2') }}"
+export AX="apptainer exec --rocm -B {{ x.get('binds', '/ptmp,/viper') }} $SIF"
+export APPTAINERENV_PREPEND_PATH=$VENV/bin APPTAINERENV_VIRTUAL_ENV=$VENV
+export HF_HUB_DISABLE_IMPLICIT_TOKEN=1
+{%- for k, v in x.get('env', {}).items() %}
+export {{ k }}="{{ v }}"
+{%- endfor %}
+export STARTUP_TIMEOUT={{ x.get('startup_timeout', 2400) }}
+export N_MAIN={{ n_main }} APN={{ apn }}
+HOSTNAMES=( $(scontrol show hostnames $SLURM_JOB_NODELIST) )
+export MAIN_HOSTS_STR="${HOSTNAMES[*]:0:$N_MAIN}" POOL_HOSTS_STR="${HOSTNAMES[*]:$N_MAIN}"
+# node_idx|apu|port|pool|model|util|args, one per replica
+export POOL_SPECS_STR="{% for s in ns.specs %}{{ s[0] }}|{{ s[1] }}|{{ s[2] }}|{{ s[3] }}|{{ s[4] }}|{{ s[5] }}|{{ s[6] }}{% if not loop.last %};{% endif %}{% endfor %}"
+# pool|router_port|policy
+export POOLS_STR="{% for p in pools %}{{ p.name }}|{{ p.port }}|{{ p.get('policy', 'cache_aware') }}{% if not loop.last %};{% endif %}{% endfor %}"
+echo "main nodes: $MAIN_HOSTS_STR | pool nodes: $POOL_HOSTS_STR"
+echo "pool replicas: $POOL_SPECS_STR"
+
+# ---- helpers shared by the batch script and the per-node scripts (sourced) ----
+cat > $VDIR/common.sh <<'COMMON'
+source /etc/profile.d/modules.sh; module load $MODULES >/dev/null 2>&1
+unset GPU_DEVICE_ORDINAL HIP_VISIBLE_DEVICES   # Slurm's GPU_DEVICE_ORDINAL aborts HIP when it disagrees
+PIDS=()
+kill_recorded() {  # only processes this script started
+    for p in "${PIDS[@]}"; do kill -TERM $p 2>/dev/null; done
+    for i in $(seq 30); do alive=0; for p in "${PIDS[@]}"; do kill -0 $p 2>/dev/null && alive=1; done; [ $alive = 0 ] && return; sleep 2; done
+    for p in "${PIDS[@]}"; do kill -KILL $p 2>/dev/null; done
+}
+wait_http() {  # url timeout_s [pid]: until the url answers 200; fails early if pid died
+    local url=$1 t=$2 pid=${3:-} t0=$(date +%s)
+    until curl -sf -o /dev/null "$url"; do
+        [ -n "$pid" ] && ! kill -0 $pid 2>/dev/null && { echo "[$(hostname)] process for $url died"; return 1; }
+        [ $(( $(date +%s) - t0 )) -gt $t ] && { echo "[$(hostname)] timeout waiting for $url"; return 1; }
+        sleep 5
+    done
+}
+start_pool_routers() {  # on the orchestrator node: wait for every replica, then one vllm-router per pool on localhost
+    [ -z "$POOLS_STR" ] && return 0
+    read -ra PH <<< "$POOL_HOSTS_STR"
+    IFS=';' read -ra SPECS <<< "$POOL_SPECS_STR"; IFS=';' read -ra POOLS <<< "$POOLS_STR"
+    for pool in "${POOLS[@]}"; do
+        IFS='|' read -r pname rport policy <<< "$pool"; urls=""
+        for spec in "${SPECS[@]}"; do
+            IFS='|' read -r n apu port name model util args <<< "$spec"; [ "$name" = "$pname" ] || continue
+            url="http://${PH[$n]}:$port"
+            wait_http "$url/health" $STARTUP_TIMEOUT || return 1
+            echo "[$(hostname)] pool $pname replica $url healthy"; urls="$urls $url"
+        done
+        $AX vllm-router --policy $policy --host 127.0.0.1 --port $rport --prometheus-port $((rport + 21000)) \
+            --worker-urls $urls --worker-startup-timeout-secs $STARTUP_TIMEOUT > $LOGDIR/pools/router_${pname}.log 2>&1 &
+        local rpid=$!; PIDS+=($rpid)
+        wait_http "http://127.0.0.1:$rport/health" 300 $rpid && wait_http "http://127.0.0.1:$rport/v1/models" 300 $rpid || return 1
+        echo "[$(hostname)] pool $pname router on 127.0.0.1:$rport ->$urls"
+    done
+}
+resume_args() {  # resume from the latest checkpoint if there is one
+    ls -d $OUTPUT_DIR/checkpoints/step_* >/dev/null 2>&1 && echo "--ckpt.resume-step -1"
+}
+COMMON
+
+# ---- pool node: one vLLM replica per APU ----
+cat > $VDIR/pool_node.sh <<'POOLNODE'
+source $VDIR/common.sh
+NODE=$1
+trap 'kill_recorded; exit 0' TERM INT
+echo "[$(hostname)] pool node $NODE: nproc=$(nproc)"
+IFS=';' read -ra SPECS <<< "$POOL_SPECS_STR"
+for spec in "${SPECS[@]}"; do
+    IFS='|' read -r n apu port name model util args <<< "$spec"; [ "$n" = "$NODE" ] || continue
+    echo "[$(hostname)] $name replica: $model on APU $apu :$port util $util"
+    CUDA_VISIBLE_DEVICES=$apu HIP_VISIBLE_DEVICES=$apu $AX vllm serve $model --host 0.0.0.0 --port $port \
+        --gpu-memory-utilization $util $args > $LOGDIR/pools/${name}_${port}.log 2>&1 &
+    PIDS+=($!)
+done
+wait
+POOLNODE
+
+source $VDIR/common.sh
+STEP_PIDS=()
+on_exit() { trap - EXIT TERM INT; kill_recorded; for p in "${STEP_PIDS[@]}"; do kill -TERM $p 2>/dev/null; done; wait; }
+trap on_exit EXIT
+trap 'exit 143' TERM INT
+# full node per task: srun would otherwise give each task 1 CPU and pin it there
+SRUN_OPTS="-c $SLURM_CPUS_PER_TASK --cpu-bind=none --mem=0 --gres=gpu:$APN"
+
+read -ra PH <<< "$POOL_HOSTS_STR"
+for ((i=0; i<{{ n_pool_nodes }}; i++)); do
+    srun -N1 -n1 $SRUN_OPTS -w ${PH[$i]} bash $VDIR/pool_node.sh $i > $LOGDIR/pools/node_$i.log 2>&1 &
+    STEP_PIDS+=($!)
+done
+
+{%- if x.get('mem_log', true) %}
+# MI300A: GPU memory is host memory and counts against the job's memory cgroup
+CG=/sys/fs/cgroup$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup)
+( while true; do echo "$(date +%T) $(hostname) cgroup=$(( $(cat $CG/memory.current 2>/dev/null || echo 0)/1073741824 ))G free=$(free -g | awk '/Mem/{print $7}')G"; sleep 60; done ) > $LOGDIR/mem_node0.log 2>&1 &
+PIDS+=($!)
+{%- endif %}
+
+{% if single %}
+# ---- single_node deployment: readers up, then rl (trainer + policy inference + orchestrator) on this node ----
+start_pool_routers || exit 1
+RESUME=$(resume_args); echo "rl ${RESUME:-(fresh)} (batch node nproc=$(nproc))"
+cd $PROJECT_DIR
+CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((APN - 1))) $AX rl @ {{ config_path }} $RESUME > $LOGDIR/rl.log 2>&1 &
+RL=$!; PIDS+=($RL)
+wait $RL; RC=$?
+echo "rl exit $RC"
+exit $RC
+{% else %}
+# ---- multi_node deployment ----
+{%- if is_disaggregated or infer_nodes_per_replica > 1 or inference_enable_expert_parallel %}
+echo "viper_rl.sbatch.j2 supports dense inference with one node per replica only"; exit 1
+{%- endif %}
+export CONFIG_DIR={{ config_dir }}
+export NUM_TRAIN_NODES={{ num_train_nodes }} NUM_INFER_NODES={{ num_infer_nodes }} GPUS_PER_NODE={{ gpus_per_node }}
+export ROUTER_PORT={{ router_port }} BACKEND_PORT={{ backend_port }} INFERENCE_TP={{ inference_tp }}
+export INFERENCE_DP_LOCAL=$((GPUS_PER_NODE / INFERENCE_TP)) ROUTER_POLICY={{ router.policy }}
+read -ra MH <<< "$MAIN_HOSTS_STR"
+INFER_HOSTS=( ${MH[@]:0:$NUM_INFER_NODES} ); TRAIN_HOSTS=( ${MH[@]:$NUM_INFER_NODES} )
+export INFER_HOSTS_STR="${INFER_HOSTS[*]}" MASTER_ADDR=${TRAIN_HOSTS[0]} MASTER_PORT=29500
+export INFER_URLS="http://${INFER_HOSTS[0]}:${ROUTER_PORT}/v1" ADMIN_URLS="" ROUTER_WORKERS=""
+for h in "${INFER_HOSTS[@]}"; do for ((k=0; k<INFERENCE_DP_LOCAL; k++)); do
+    ADMIN_URLS="${ADMIN_URLS:+$ADMIN_URLS }http://$h:$((BACKEND_PORT + k))/v1"; ROUTER_WORKERS="$ROUTER_WORKERS http://$h:$((BACKEND_PORT + k))"
+done; done
+export ORCH_PROCID={% if orchestrator_on_inference %}$((NUM_INFER_NODES - 1)){% else %}$NUM_INFER_NODES{% endif %}
+export RESUME=$(resume_args)
+echo "infer: ${INFER_HOSTS[*]} train: ${TRAIN_HOSTS[*]} ${RESUME:-(fresh)}"
+# the bundled launcher cleans stale rollouts/broadcasts on submit; a chained job has to do it itself
+$AX python -c "
+from pathlib import Path
+from prime_rl.utils.pathing import clean_future_steps, get_ckpt_dir, resolve_latest_ckpt_step
+o = Path('$OUTPUT_DIR'); s = resolve_latest_ckpt_step(get_ckpt_dir(o)) if '$RESUME' else None
+clean_future_steps(o, -1 if s is None else s)"
+
+cat > $VDIR/main_node.sh <<'MAINNODE'
+source $VDIR/common.sh
+trap 'kill_recorded; exit 143' TERM INT
+echo "[$(hostname)] main task $SLURM_PROCID: nproc=$(nproc)"
+cd $PROJECT_DIR; ulimit -n 65536
+export NCCL_IB_HCA=$(ibv_devinfo 2>/dev/null | sed -n -e "/hca_id/p" -e "/link_layer:/p" | grep -B1 InfiniBand | grep hca_id | sed -e "s/^hca_id://g" | tr -d "[:blank:]" | paste -sd,)
+if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
+{%- for k, v in inference_env_vars.items() %}
+    export {{ k }}="{{ v }}"
+{%- endfor %}
+    for ((d=0; d<INFERENCE_DP_LOCAL; d++)); do
+        G=$(seq -s, $((d * INFERENCE_TP)) $((d * INFERENCE_TP + INFERENCE_TP - 1)))
+        CUDA_VISIBLE_DEVICES=$G HIP_VISIBLE_DEVICES=$G $AX inference @ $CONFIG_DIR/inference.toml --server.host 0.0.0.0 \
+            --server.port $((BACKEND_PORT + d)) --parallel.dp 1 --data-parallel-size-local 1 --api-server-count 1 \
+            > $LOGDIR/inference/node_${SLURM_PROCID}_rank$d.log 2>&1 &
+        PIDS+=($!)
+    done
+    if [ "$SLURM_PROCID" -eq 0 ]; then
+        $AX vllm-router --policy $ROUTER_POLICY --host 0.0.0.0 --port $ROUTER_PORT --prometheus-port $((ROUTER_PORT + 21000)) \
+            --request-id-headers x-session-id --worker-urls $ROUTER_WORKERS --worker-startup-timeout-secs $STARTUP_TIMEOUT \
+            > $LOGDIR/inference/router.log 2>&1 &
+        PIDS+=($!)
+    fi
+else
+{%- for k, v in trainer_env_vars.items() %}
+    export {{ k }}="{{ v }}"
+{%- endfor %}
+    CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((GPUS_PER_NODE - 1))) $AX torchrun --role=trainer --nnodes=$NUM_TRAIN_NODES \
+        --nproc-per-node=$GPUS_PER_NODE --node-rank=$((SLURM_PROCID - NUM_INFER_NODES)) \
+        --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT --rdzv-id=job_$SLURM_JOB_ID --log-dir=$LOGDIR/trainer/torchrun \
+        --tee=3 --redirects=3 --local-ranks-filter={{ ranks_filter }} -m prime_rl.trainer.rl.train \
+        @ $CONFIG_DIR/trainer.toml $RESUME {% if use_zmq_transport %}--rollout_transport.host $MASTER_ADDR {% endif %}\
+        > $LOGDIR/trainer/node_$((SLURM_PROCID - NUM_INFER_NODES)).log 2>&1 &
+    PIDS+=($!)
+fi
+if [ "$SLURM_PROCID" -eq "$ORCH_PROCID" ]; then
+    start_pool_routers || { kill_recorded; exit 1; }
+{%- for k, v in orchestrator_env_vars.items() %}
+    export {{ k }}="{{ v }}"
+{%- endfor %}
+{%- for name in train_env_names %}
+    mkdir -p $LOGDIR/envs/train
+    CUDA_VISIBLE_DEVICES= $AX env-server @ $CONFIG_DIR/envs/train/{{ name }}.toml > $LOGDIR/envs/train/{{ name }}.log 2>&1 &
+    PIDS+=($!)
+{%- endfor %}
+{%- for name in eval_env_names %}
+    mkdir -p $LOGDIR/envs/eval
+    CUDA_VISIBLE_DEVICES= $AX env-server @ $CONFIG_DIR/envs/eval/{{ name }}.toml > $LOGDIR/envs/eval/{{ name }}.log 2>&1 &
+    PIDS+=($!)
+{%- endfor %}
+    CUDA_VISIBLE_DEVICES= $AX orchestrator @ $CONFIG_DIR/orchestrator.toml --model.client.base-url $INFER_URLS \
+        --model.client.admin-base-url $ADMIN_URLS $RESUME \
+        {% if use_nccl_broadcast %}--weight_broadcast.host $MASTER_ADDR {% endif %}{% if use_zmq_transport %}--rollout_transport.host $MASTER_ADDR {% endif %}\
+        > $LOGDIR/orchestrator.log 2>&1 &
+    PIDS+=($!)
+fi
+wait -n; RC=$?
+echo "[$(hostname)] a component exited ($RC); stopping this node's processes"
+{%- if cleanup_grace_period %}
+[ $RC -ne 0 ] && sleep {{ [cleanup_grace_period, 600] | min }}   # let in-flight checkpoints on this node flush
+{%- endif %}
+kill_recorded; exit $RC
+MAINNODE
+
+srun -N $N_MAIN -n $N_MAIN --ntasks-per-node=1 $SRUN_OPTS --kill-on-bad-exit=1 -w $(echo $MAIN_HOSTS_STR | tr ' ' ,) bash $VDIR/main_node.sh &
+MAIN=$!; STEP_PIDS+=($MAIN)
+wait $MAIN; RC=$?
+echo "main step exit $RC"
+exit $RC
+{% endif %}

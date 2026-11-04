@@ -121,8 +121,59 @@ prime-rl's bundled `multi_node_rl.sbatch.j2` doesn't run on Viper as-is:
 - Its node cleanup pattern-kills `vllm`/`python` processes and calls `nvidia-smi`.
 - It has no place for the reward-reader vLLM servers.
 
-`slurm.template_path` takes a custom template, so the plan is a Viper template:
-- the same node split and router logic;
-- every component launched in `apptainer exec --rocm` with the venv;
-- no `uv`, no pattern kills;
-- extra reader nodes whose URLs are passed into the env config.
+`rocm/viper_rl.sbatch.j2` is a Viper template for `slurm.template_path`:
+- every component runs in `apptainer exec --rocm` with the venv;
+- no `uv`, no pattern kills: cleanup kills only the PIDs the script recorded;
+- reward-reader **pools**: R vLLM replicas (one per APU) on extra nodes after the main
+  nodes, behind one `vllm-router` on the orchestrator node's `localhost:<port>`, so the
+  taskset keeps a single reader URL. The orchestrator starts only after every replica and
+  the router answer;
+- resumes with `--ckpt.resume-step -1` when `<output_dir>/checkpoints/step_*` exists, so
+  jobs can be chained with `--dependency=afterany`.
+
+The pools and site paths go in `[slurm.template_extra]` (a free-form dict this branch adds
+to `SlurmConfig`; the bundled templates ignore it). See the header of the template for all
+keys.
+
+```toml
+[slurm]
+template_path = "/u/atatjer/src/prime-rl-brutus/rocm/viper_rl.sbatch.j2"
+project_dir = "/u/atatjer/src/prime-rl-brutus"
+partition = "apu"
+account = "mmgt_apu"
+time = "01:30:00"
+
+[slurm.template_extra]
+env = { HF_HOME = "/ptmp/atatjer/hf", HF_HUB_OFFLINE = "1", WANDB_MODE = "disabled" }
+
+[[slurm.template_extra.pools]]
+name = "reader"
+model = "Qwen/Qwen3.5-4B"
+port = 8300          # router port; reader_base_url = "http://localhost:8300/v1"
+replicas = 2
+util = 0.85
+policy = "round_robin"   # default cache_aware pins most requests to one replica
+args = "--max-num-seqs 256 --max-model-len 16384 --max-num-batched-tokens 2048 --enable-prefix-caching --language-model-only --attention-backend TRITON_ATTN"
+```
+
+Render in the container, submit on the host (there is no `sbatch` in the container):
+
+```
+cd /ptmp/atatjer/brutus
+~/src/prime-rl-brutus/rocm/ce.sh rl @ configs/<cfg>.toml --dry-run     # writes <output_dir>/rl.sbatch
+sbatch <output_dir>/rl.sbatch
+sbatch --dependency=afterany:<jobid> <output_dir>/rl.sbatch   # chain: resumes from the latest checkpoint
+```
+
+Viper gotchas the template handles:
+- `apu` caps `--cpus-per-task` at 48 (that gives the task all 96 hardware threads).
+  Without `-c`, srun steps get 1 CPU and fail with "More processors requested than
+  permitted".
+- `#` followed by `{` in bash (`${#arr[@]}`) opens a Jinja comment; avoid it in the template.
+
+Tested (job 12702230, single_node + one 2-replica 4B reader pool, 2 nodes, 5 steps): the
+job completed, the router served all reader traffic, and mismatch KL was 2-4e-4.
+Resubmitting the same `rl.sbatch` with `max_steps = 7` (job 12702673) resumed from
+`step_5` and ran steps 6-7. The
+`multi_node` branch (trainer and policy inference on separate nodes) renders but has not
+been run.
