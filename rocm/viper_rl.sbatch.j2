@@ -89,6 +89,11 @@ wait_http() {  # url timeout_s [pid]: until the url answers 200; fails early if 
         sleep 5
     done
 }
+# The workers are a fixed set that this job owns, so the routers never eject one. A vLLM API server can stall for
+# minutes while it serializes a burst of finished 8k-token responses with logprobs; with the defaults (5 s health
+# timeout, 3 failures at 60 s, circuit breaker on) the policy router dropped both workers at a step boundary and
+# 1629 rollouts failed instantly with "No available workers" (lanhid job 12709100).
+ROUTER_KEEP="--health-check-timeout-secs 60 --health-failure-threshold 1000000 --disable-circuit-breaker"
 start_pool_routers() {  # on the orchestrator node: wait for every replica, then one vllm-router per pool on localhost
     [ -z "$POOLS_STR" ] && return 0
     read -ra PH <<< "$POOL_HOSTS_STR"
@@ -102,7 +107,7 @@ start_pool_routers() {  # on the orchestrator node: wait for every replica, then
             echo "[$(hostname)] pool $pname replica $url healthy"; urls="$urls $url"
         done
         $AX vllm-router --policy $policy --host 127.0.0.1 --port $rport --prometheus-port $((rport + 21000)) \
-            --worker-urls $urls --worker-startup-timeout-secs $STARTUP_TIMEOUT > $LOGDIR/pools/router_${pname}.log 2>&1 &
+            --worker-urls $urls --worker-startup-timeout-secs $STARTUP_TIMEOUT $ROUTER_KEEP > $LOGDIR/pools/router_${pname}.log 2>&1 &
         local rpid=$!; PIDS+=($rpid)
         wait_http "http://127.0.0.1:$rport/health" 300 $rpid && wait_http "http://127.0.0.1:$rport/v1/models" 300 $rpid || return 1
         echo "[$(hostname)] pool $pname router on 127.0.0.1:$rport ->$urls"
@@ -208,7 +213,7 @@ if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
     done
     if [ "$SLURM_PROCID" -eq 0 ]; then
         $AX vllm-router --policy $ROUTER_POLICY --host 0.0.0.0 --port $ROUTER_PORT --prometheus-port $((ROUTER_PORT + 21000)) \
-            --request-id-headers x-session-id --worker-urls $ROUTER_WORKERS --worker-startup-timeout-secs $STARTUP_TIMEOUT \
+            --request-id-headers x-session-id --worker-urls $ROUTER_WORKERS --worker-startup-timeout-secs $STARTUP_TIMEOUT $ROUTER_KEEP \
             > $LOGDIR/inference/router.log 2>&1 &
         PIDS+=($!)
     fi
