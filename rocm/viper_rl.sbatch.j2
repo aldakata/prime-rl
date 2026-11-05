@@ -226,20 +226,22 @@ else
 fi
 if [ "$SLURM_PROCID" -eq "$ORCH_PROCID" ]; then
     start_pool_routers || { kill_recorded; exit 1; }
+    # orchestrator and env servers keep the node's GPUs visible (as the bundled launchers): on ROCm, importing torchao
+    # queries the device (torchao.utils.is_MI300) and fails with "No CUDA GPUs are available" when none is visible
 {%- for k, v in orchestrator_env_vars.items() %}
     export {{ k }}="{{ v }}"
 {%- endfor %}
 {%- for name in train_env_names %}
     mkdir -p $LOGDIR/envs/train
-    CUDA_VISIBLE_DEVICES= $AX env-server @ $CONFIG_DIR/envs/train/{{ name }}.toml > $LOGDIR/envs/train/{{ name }}.log 2>&1 &
+    $AX env-server @ $CONFIG_DIR/envs/train/{{ name }}.toml > $LOGDIR/envs/train/{{ name }}.log 2>&1 &
     PIDS+=($!)
 {%- endfor %}
 {%- for name in eval_env_names %}
     mkdir -p $LOGDIR/envs/eval
-    CUDA_VISIBLE_DEVICES= $AX env-server @ $CONFIG_DIR/envs/eval/{{ name }}.toml > $LOGDIR/envs/eval/{{ name }}.log 2>&1 &
+    $AX env-server @ $CONFIG_DIR/envs/eval/{{ name }}.toml > $LOGDIR/envs/eval/{{ name }}.log 2>&1 &
     PIDS+=($!)
 {%- endfor %}
-    CUDA_VISIBLE_DEVICES= $AX orchestrator @ $CONFIG_DIR/orchestrator.toml --model.client.base-url $INFER_URLS \
+    $AX orchestrator @ $CONFIG_DIR/orchestrator.toml --model.client.base-url $INFER_URLS \
         --model.client.admin-base-url $ADMIN_URLS $RESUME \
         {% if use_nccl_broadcast %}--weight_broadcast.host $MASTER_ADDR {% endif %}{% if use_zmq_transport %}--rollout_transport.host $MASTER_ADDR {% endif %}\
         > $LOGDIR/orchestrator.log 2>&1 &
