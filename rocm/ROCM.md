@@ -175,5 +175,26 @@ Tested (job 12702230, single_node + one 2-replica 4B reader pool, 2 nodes, 5 ste
 job completed, the router served all reader traffic, and mismatch KL was 2-4e-4.
 Resubmitting the same `rl.sbatch` with `max_steps = 7` (job 12702673) resumed from
 `step_5` and ran steps 6-7. The
-`multi_node` branch (trainer and policy inference on separate nodes) renders but has not
-been run.
+`multi_node` branch (trainer and policy inference on separate nodes) runs: lanhid job 12712011
+(3 nodes: 2 policy APUs behind vllm-router, 2 trainer APUs, 2 x 27B readers) ran clean.
+
+Lessons from the lanhid/hid4b launches (2026-11-05):
+- **The orchestrator and env servers need a visible GPU.** On ROCm, importing torchao queries the
+  device (`torchao.utils.is_MI300`) and fails with "No CUDA GPUs are available" if
+  `CUDA_VISIBLE_DEVICES` is empty (job 12708157).
+- **Routers must never eject a worker.** A policy API server stalled for ~100 s at a step
+  boundary, probably while it serialized a burst of finished 8k-token responses with logprobs.
+  The router's default health check (5 s timeout, 3 failures) dropped both workers, and 1629
+  rollouts failed with "No available workers" (job 12709100). The template now passes
+  `--health-check-timeout-secs 60 --health-failure-threshold 1000000 --disable-circuit-breaker`.
+  prime-rl's own single-node router uses threshold 20 and timeout 30.
+- **Size in-flight rollouts to the KV cache, not the batch.** The policy router times requests out
+  at 1800 s (`--request-timeout-secs`). With `max_inflight_episodes` x ~10k tokens above the KV
+  cache, vLLM keeps preempting the longest requests until they time out, so the long rollouts are
+  the ones dropped (a biased loss). Results on 1 APU:
+  - 512 in flight: 79% errors (job 12708192).
+  - 256 in flight on a 1.62M-token cache: 9% errors (job 12711052).
+  - 160 per APU: no preemption and no errors.
+  - The KV cache is ~1.62M tokens for Qwen3.5-4B at util 0.75 and ~1.9M at 0.85.
+- **27B readers with `reader_skip_wrong` are nearly idle.** Scoring takes median 0.1 s against
+  250-350 s of generation, so 2 replicas are enough.
