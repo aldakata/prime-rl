@@ -61,10 +61,15 @@ class SlurmConfig(BaseConfig):
     shared_fs: bool = True
     """Whether the project filesystem (including the venv) is shared across nodes (e.g. NFS). When True, a single ``uv sync`` on the batch node suffices. Set to False when the venv is node-local (e.g. ``UV_PROJECT_ENVIRONMENT`` on ``/tmp``) so ``uv sync`` runs on every node via srun."""
 
+    template_extra: dict = {}
+    """Free-form variables for a custom ``template_path``, available in the template as ``extra`` (e.g. the
+    reader pools of ``rocm/viper_rl.sbatch.j2``). Ignored by the bundled templates."""
+
     @property
     def template_vars(self) -> dict:
         """Common template variables for all SLURM templates."""
         return {
+            "extra": self.template_extra,
             "job_name": self.job_name,
             "project_dir": self.project_dir,
             "partition": self.partition,
