@@ -116,6 +116,12 @@ start_pool_routers() {  # on the orchestrator node: wait for every replica, then
 resume_args() {  # resume from the latest checkpoint if there is one
     ls -d $OUTPUT_DIR/checkpoints/step_* >/dev/null 2>&1 && echo "--ckpt.resume-step -1"
 }
+# The trainer registers a run from <run>/control/orch.toml as soon as it finds the file, and takes the run's
+# progress (the broadcast step numbering) from that config's ckpt.resume_step. A chained job finds the previous
+# job's file, written without resume_step, whenever the trainer is up before the new orchestrator (which waits for
+# the reader pools): the run then restarts at step 1, broadcasts land in broadcasts/step_1, step_2, ... and the
+# orchestrator waits forever for v<resume+1> (lanhid job 12721079). Remove it so the trainer waits for the new one.
+drop_stale_run_configs() { rm -f $OUTPUT_DIR/run_*/control/orch.toml; }
 COMMON
 
 # ---- pool node: one vLLM replica per APU ----
@@ -159,7 +165,7 @@ PIDS+=($!)
 {% if single %}
 # ---- single_node deployment: readers up, then rl (trainer + policy inference + orchestrator) on this node ----
 start_pool_routers || exit 1
-RESUME=$(resume_args); echo "rl ${RESUME:-(fresh)} (batch node nproc=$(nproc))"
+RESUME=$(resume_args); echo "rl ${RESUME:-(fresh)} (batch node nproc=$(nproc))"; drop_stale_run_configs
 cd $PROJECT_DIR
 CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((APN - 1))) $AX rl @ {{ config_path }} $RESUME > $LOGDIR/rl.log 2>&1 &
 RL=$!; PIDS+=($RL)
@@ -191,6 +197,7 @@ from pathlib import Path
 from prime_rl.utils.pathing import clean_future_steps, get_ckpt_dir, resolve_latest_ckpt_step
 o = Path('$OUTPUT_DIR'); s = resolve_latest_ckpt_step(get_ckpt_dir(o)) if '$RESUME' else None
 clean_future_steps(o, -1 if s is None else s)"
+drop_stale_run_configs
 
 cat > $VDIR/main_node.sh <<'MAINNODE'
 source $VDIR/common.sh
